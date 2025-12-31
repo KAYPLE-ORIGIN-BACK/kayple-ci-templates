@@ -43,10 +43,18 @@ on:
         type: number
         default: 30
         description: 'Max health check attempts'
+      java-opts:
+        type: string
+        default: '-Xms512m -Xmx1024m'
+        description: 'JVM options'
       docker-env-vars:
         type: string
         default: ''
         description: 'Additional docker -e flags (multiline, one per line: KEY=value)'
+      docker-volumes:
+        type: string
+        default: ''
+        description: 'Docker volume mounts (multiline, format: host_path:container_path)'
     secrets:
       SSH_HOST:
         required: true
@@ -60,6 +68,10 @@ on:
         required: true
       DOCKER_HUB_ACCESS_TOKEN:
         required: true
+      EMAIL_PASSWORD:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
 
 jobs:
   deploy:
@@ -68,7 +80,7 @@ jobs:
     outputs:
       active-port: ${{ steps.deploy.outputs.active_port }}
       active-color: ${{ steps.deploy.outputs.active_color }}
-    
+
     steps:
       - name: Deploy with Blue/Green strategy
         id: deploy
@@ -94,9 +106,11 @@ jobs:
             CONTAINER_PORT="${{ inputs.container-port }}"
             BLUE_PORT="${{ inputs.blue-port }}"
             GREEN_PORT="${{ inputs.green-port }}"
+            JAVA_OPTS="${{ inputs.java-opts }}"
             CONTAINER_PREFIX="${PROJECT}-${APP}-${ENV}"
             
             echo "📦 Image: $IMAGE_TAG"
+            echo "☕ JVM Options: $JAVA_OPTS"
             
             # Pull image
             echo "🔄 Pulling Docker image..."
@@ -112,7 +126,7 @@ jobs:
             if [[ -n "$CURRENT_CONTAINER" ]]; then
               CURRENT_PORT=$(docker port $CURRENT_CONTAINER | grep "$CONTAINER_PORT/tcp" | cut -d':' -f2)
               echo "🔍 Current: $CURRENT_CONTAINER (port $CURRENT_PORT)"
-              
+            
               if [[ "$CURRENT_PORT" == "$BLUE_PORT" ]]; then
                 NEW_PORT=$GREEN_PORT
                 COLOR="GREEN"
@@ -134,10 +148,21 @@ jobs:
             docker stop $NEW_CONTAINER 2>/dev/null || true
             docker rm $NEW_CONTAINER 2>/dev/null || true
             
-            # Build docker run command with env vars
+            # Build docker run command
             DOCKER_CMD="docker run -d --name $NEW_CONTAINER"
             DOCKER_CMD="$DOCKER_CMD -p $NEW_PORT:$CONTAINER_PORT"
             DOCKER_CMD="$DOCKER_CMD -e SPRING_PROFILES_ACTIVE=$ENV"
+            DOCKER_CMD="$DOCKER_CMD -e JAVA_OPTS=\"$JAVA_OPTS\""
+            
+            # Add EMAIL_PASSWORD if provided
+            if [ -n "${{ secrets.EMAIL_PASSWORD }}" ]; then
+              DOCKER_CMD="$DOCKER_CMD -e EMAIL_PASSWORD=\"${{ secrets.EMAIL_PASSWORD }}\""
+            fi
+            
+            # Add SLACK_WEBHOOK_URL if provided
+            if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+              DOCKER_CMD="$DOCKER_CMD -e SLACK_WEBHOOK_URL=\"${{ secrets.SLACK_WEBHOOK_URL }}\""
+            fi
             
             # Add additional env vars
             ENV_VARS="${{ inputs.docker-env-vars }}"
@@ -147,6 +172,16 @@ jobs:
                   DOCKER_CMD="$DOCKER_CMD -e \"$line\""
                 fi
               done <<< "$ENV_VARS"
+            fi
+            
+            # Add volume mounts
+            VOLUMES="${{ inputs.docker-volumes }}"
+            if [ -n "$VOLUMES" ]; then
+              while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                  DOCKER_CMD="$DOCKER_CMD -v \"$line\""
+                fi
+              done <<< "$VOLUMES"
             fi
             
             DOCKER_CMD="$DOCKER_CMD --restart always $IMAGE_TAG"
@@ -170,18 +205,18 @@ jobs:
             
             for i in $(seq 1 $MAX_ATTEMPTS); do
               echo "  Attempt $i/$MAX_ATTEMPTS..."
-              
+            
               if curl -f -s "$HEALTH_URL" > /dev/null 2>&1; then
                 echo "✅ Health check passed!"
                 break
               fi
-              
+            
               if ! docker ps -q --filter "name=$NEW_CONTAINER" | grep -q .; then
                 echo "❌ Container stopped!"
                 docker logs $NEW_CONTAINER --tail 30
                 exit 1
               fi
-              
+            
               sleep 10
             done
             
@@ -199,8 +234,8 @@ jobs:
             
             if [ -f "$NGINX_CONF" ]; then
               sudo cp $NGINX_CONF ${NGINX_CONF}.backup.$(date +%s)
-              sudo sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*\//proxy_pass http:\/\/127.0.0.1:$NEW_PORT\//g" $NGINX_CONF
-              
+              sudo sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
+            
               if sudo nginx -t; then
                 sudo nginx -s reload
                 echo "✅ Nginx updated"
@@ -237,6 +272,7 @@ jobs:
             echo "   Container: $NEW_CONTAINER"
             echo "   Port: $NEW_PORT"
             echo "   Color: $COLOR"
+            echo "   JVM: $JAVA_OPTS"
             
             # Set outputs
             echo "active_port=$NEW_PORT" >> $GITHUB_OUTPUT
