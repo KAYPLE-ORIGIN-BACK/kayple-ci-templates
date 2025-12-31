@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Logs
+*.log

@@ -1,0 +1,79 @@
+name: Register Prometheus Target
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+        description: 'Environment (dev, pro, etc.)'
+      project-name:
+        type: string
+        required: true
+        description: 'Project name'
+      domain:
+        type: string
+        required: true
+        description: 'Domain to monitor'
+      prometheus-targets-dir:
+        type: string
+        default: '~/prometheus/targets'
+        description: 'Prometheus targets directory'
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: false
+      SSH_PASSWORD:
+        required: false
+      SSH_PORT:
+        required: false
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Register with Prometheus
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "📊 Registering with Prometheus..."
+            
+            TARGETS_DIR="${{ inputs.prometheus-targets-dir }}"
+            TARGET_FILE="$TARGETS_DIR/${{ inputs.project-name }}-${{ inputs.environment }}.json"
+            
+            # Expand ~ to home directory
+            TARGETS_DIR=$(eval echo $TARGETS_DIR)
+            TARGET_FILE=$(eval echo $TARGET_FILE)
+            
+            mkdir -p "$TARGETS_DIR"
+            
+            cat > "$TARGET_FILE" << EOF
+            [
+              {
+                "targets": ["${{ inputs.domain }}"],
+                "labels": {
+                  "job": "spring-boot-services",
+                  "application": "${{ inputs.project-name }}-${{ inputs.environment }}",
+                  "environment": "${{ inputs.environment }}"
+                }
+              }
+            ]
+            EOF
+            
+            # Validate JSON
+            if python3 -m json.tool "$TARGET_FILE" > /dev/null 2>&1; then
+              echo "✅ Prometheus target registered: ${{ inputs.domain }}"
+              cat "$TARGET_FILE"
+            else
+              echo "❌ JSON validation failed!"
+              exit 1
+            fi

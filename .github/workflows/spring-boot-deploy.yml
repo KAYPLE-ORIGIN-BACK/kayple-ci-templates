@@ -1,0 +1,243 @@
+name: Spring Boot Deploy (Blue/Green)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+        description: 'Environment (dev, pro, etc.)'
+      project-name:
+        type: string
+        required: true
+        description: 'Project name'
+      application-name:
+        type: string
+        default: 'api'
+        description: 'Application name'
+      image-tag:
+        type: string
+        required: true
+        description: 'Docker image tag to deploy'
+      container-port:
+        type: string
+        default: '8080'
+        description: 'Container internal port'
+      blue-port:
+        type: string
+        required: true
+        description: 'Blue deployment port'
+      green-port:
+        type: string
+        required: true
+        description: 'Green deployment port'
+      domain:
+        type: string
+        required: true
+        description: 'Domain for Nginx config'
+      health-check-path:
+        type: string
+        default: '/actuator/health/liveness'
+        description: 'Health check endpoint'
+      health-check-attempts:
+        type: number
+        default: 30
+        description: 'Max health check attempts'
+      docker-env-vars:
+        type: string
+        default: ''
+        description: 'Additional docker -e flags (multiline, one per line: KEY=value)'
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+      SSH_PORT:
+        required: false
+      DOCKER_HUB_USERNAME:
+        required: true
+      DOCKER_HUB_ACCESS_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      active-port: ${{ steps.deploy.outputs.active_port }}
+      active-color: ${{ steps.deploy.outputs.active_color }}
+    
+    steps:
+      - name: Deploy with Blue/Green strategy
+        id: deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            
+            echo "🚀 Starting Blue/Green deployment..."
+            
+            # Docker Hub login
+            echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+            
+            # Variables
+            IMAGE_TAG="${{ inputs.image-tag }}"
+            PROJECT="${{ inputs.project-name }}"
+            APP="${{ inputs.application-name }}"
+            ENV="${{ inputs.environment }}"
+            CONTAINER_PORT="${{ inputs.container-port }}"
+            BLUE_PORT="${{ inputs.blue-port }}"
+            GREEN_PORT="${{ inputs.green-port }}"
+            CONTAINER_PREFIX="${PROJECT}-${APP}-${ENV}"
+            
+            echo "📦 Image: $IMAGE_TAG"
+            
+            # Pull image
+            echo "🔄 Pulling Docker image..."
+            if ! docker pull $IMAGE_TAG; then
+              echo "❌ Docker pull failed!"
+              exit 1
+            fi
+            echo "✅ Pull completed"
+            
+            # Determine current active container and port
+            CURRENT_CONTAINER=$(docker ps --filter "name=${CONTAINER_PREFIX}" --format "{{.Names}}" | head -1)
+            
+            if [[ -n "$CURRENT_CONTAINER" ]]; then
+              CURRENT_PORT=$(docker port $CURRENT_CONTAINER | grep "$CONTAINER_PORT/tcp" | cut -d':' -f2)
+              echo "🔍 Current: $CURRENT_CONTAINER (port $CURRENT_PORT)"
+              
+              if [[ "$CURRENT_PORT" == "$BLUE_PORT" ]]; then
+                NEW_PORT=$GREEN_PORT
+                COLOR="GREEN"
+              else
+                NEW_PORT=$BLUE_PORT
+                COLOR="BLUE"
+              fi
+            else
+              NEW_PORT=$BLUE_PORT
+              COLOR="BLUE"
+              echo "🆕 First deployment"
+            fi
+            
+            echo "🎯 Deploying to $COLOR (port $NEW_PORT)"
+            
+            # Prepare new container
+            NEW_CONTAINER="${CONTAINER_PREFIX}-${COLOR}"
+            
+            docker stop $NEW_CONTAINER 2>/dev/null || true
+            docker rm $NEW_CONTAINER 2>/dev/null || true
+            
+            # Build docker run command with env vars
+            DOCKER_CMD="docker run -d --name $NEW_CONTAINER"
+            DOCKER_CMD="$DOCKER_CMD -p $NEW_PORT:$CONTAINER_PORT"
+            DOCKER_CMD="$DOCKER_CMD -e SPRING_PROFILES_ACTIVE=$ENV"
+            
+            # Add additional env vars
+            ENV_VARS="${{ inputs.docker-env-vars }}"
+            if [ -n "$ENV_VARS" ]; then
+              while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                  DOCKER_CMD="$DOCKER_CMD -e \"$line\""
+                fi
+              done <<< "$ENV_VARS"
+            fi
+            
+            DOCKER_CMD="$DOCKER_CMD --restart always $IMAGE_TAG"
+            
+            # Run new container
+            echo "🚀 Starting $COLOR container..."
+            eval $DOCKER_CMD
+            
+            if ! docker ps -q --filter "name=$NEW_CONTAINER" | grep -q .; then
+              echo "❌ Container failed to start!"
+              docker logs $NEW_CONTAINER --tail 30
+              exit 1
+            fi
+            
+            echo "✅ Container started"
+            
+            # Health check
+            echo "🏥 Health check starting..."
+            HEALTH_URL="http://localhost:$NEW_PORT${{ inputs.health-check-path }}"
+            MAX_ATTEMPTS=${{ inputs.health-check-attempts }}
+            
+            for i in $(seq 1 $MAX_ATTEMPTS); do
+              echo "  Attempt $i/$MAX_ATTEMPTS..."
+              
+              if curl -f -s "$HEALTH_URL" > /dev/null 2>&1; then
+                echo "✅ Health check passed!"
+                break
+              fi
+              
+              if ! docker ps -q --filter "name=$NEW_CONTAINER" | grep -q .; then
+                echo "❌ Container stopped!"
+                docker logs $NEW_CONTAINER --tail 30
+                exit 1
+              fi
+              
+              sleep 10
+            done
+            
+            if [ $i -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Health check failed!"
+              docker logs $NEW_CONTAINER --tail 30
+              docker stop $NEW_CONTAINER || true
+              docker rm $NEW_CONTAINER || true
+              exit 1
+            fi
+            
+            # Update Nginx
+            echo "🔄 Updating Nginx..."
+            NGINX_CONF="/etc/nginx/sites-available/${{ inputs.domain }}"
+            
+            if [ -f "$NGINX_CONF" ]; then
+              sudo cp $NGINX_CONF ${NGINX_CONF}.backup.$(date +%s)
+              sudo sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*\//proxy_pass http:\/\/127.0.0.1:$NEW_PORT\//g" $NGINX_CONF
+              
+              if sudo nginx -t; then
+                sudo nginx -s reload
+                echo "✅ Nginx updated"
+              else
+                echo "❌ Nginx config error, rolling back..."
+                sudo cp ${NGINX_CONF}.backup.* $NGINX_CONF 2>/dev/null || true
+                exit 1
+              fi
+            else
+              echo "⚠️ Nginx config not found: $NGINX_CONF"
+            fi
+            
+            # Verify traffic switch
+            sleep 5
+            if curl -f -s -k "https://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1; then
+              echo "✅ Traffic switched successfully"
+            else
+              echo "⚠️ Traffic verification skipped"
+            fi
+            
+            # Remove old container
+            if [[ -n "$CURRENT_CONTAINER" ]]; then
+              echo "🧹 Removing old container: $CURRENT_CONTAINER"
+              sleep 10
+              docker stop $CURRENT_CONTAINER || true
+              docker rm $CURRENT_CONTAINER || true
+            fi
+            
+            # Cleanup old images
+            docker image prune -f
+            
+            echo ""
+            echo "🎉 Deployment completed!"
+            echo "   Container: $NEW_CONTAINER"
+            echo "   Port: $NEW_PORT"
+            echo "   Color: $COLOR"
+            
+            # Set outputs
+            echo "active_port=$NEW_PORT" >> $GITHUB_OUTPUT
+            echo "active_color=$COLOR" >> $GITHUB_OUTPUT
