@@ -34,7 +34,7 @@ on:
     secrets:
       DOCKER_HUB_ACCESS_TOKEN:
         required: true
-      # 키 파일들 (optional)
+      # Key files (optional)
       FIREBASE_KEY_BASE64:
         required: false
       APP_STORE_KEY_BASE64:
@@ -65,19 +65,19 @@ jobs:
           if [ -n "${{ secrets.FIREBASE_KEY_BASE64 }}" ] || \
              [ -n "${{ secrets.APP_STORE_KEY_BASE64 }}" ] || \
              [ -n "${{ secrets.IAP_PAYMENT_KEY_BASE64 }}" ]; then
-            
+          
             mkdir -p src/main/resources/key-store
-            
+          
             if [ -n "${{ secrets.FIREBASE_KEY_BASE64 }}" ]; then
               echo "${{ secrets.FIREBASE_KEY_BASE64 }}" | base64 -d > src/main/resources/key-store/${{ inputs.project-name }}-firebase-key.json
               echo "✅ Firebase key restored"
             fi
-            
+          
             if [ -n "${{ secrets.APP_STORE_KEY_BASE64 }}" ]; then
               echo "${{ secrets.APP_STORE_KEY_BASE64 }}" | base64 -d > src/main/resources/key-store/${{ inputs.project-name }}-app-store-key.p8
               echo "✅ App Store key restored"
             fi
-            
+          
             if [ -n "${{ secrets.IAP_PAYMENT_KEY_BASE64 }}" ]; then
               echo "${{ secrets.IAP_PAYMENT_KEY_BASE64 }}" | base64 -d > src/main/resources/key-store/${{ inputs.project-name }}-iap-payment-key.json
               echo "✅ IAP Payment key restored"
@@ -138,26 +138,29 @@ jobs:
           while true; do
             RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
               "https://hub.docker.com/v2/repositories/${{ inputs.docker-hub-username }}/${{ inputs.project-name }}-${{ inputs.application-name }}/tags/?page=$PAGE&page_size=100")
-            
+          
             PAGE_TAGS=$(echo "$RESPONSE" | jq -r ".results[] | select(.name | startswith(\"${{ inputs.environment }}.\")) | .name")
-            
+          
             if [ -z "$PAGE_TAGS" ]; then
               break
             fi
-            
+          
             ALL_TAGS="$ALL_TAGS $PAGE_TAGS"
-            
+          
             HAS_NEXT=$(echo "$RESPONSE" | jq -r '.next')
             if [ "$HAS_NEXT" == "null" ]; then
               break
             fi
-            
+          
             PAGE=$((PAGE+1))
           done
           
           # Sort by run number and keep recent ones
           SORTED_TAGS=$(echo $ALL_TAGS | tr ' ' '\n' | grep "^${{ inputs.environment }}\." | sort -t'.' -k4 -nr)
-          TAGS_TO_DELETE=$(echo "$SORTED_TAGS" | tail -n +$((inputs.keep-images + 1)))
+          
+          # FIX: Store keep-images in bash variable first
+          KEEP_COUNT=${{ inputs.keep-images }}
+          TAGS_TO_DELETE=$(echo "$SORTED_TAGS" | tail -n +$((KEEP_COUNT + 1)))
           
           if [ -n "$TAGS_TO_DELETE" ]; then
             echo "🗑️ Deleting old tags..."

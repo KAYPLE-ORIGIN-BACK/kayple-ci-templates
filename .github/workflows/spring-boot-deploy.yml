@@ -202,12 +202,14 @@ jobs:
             echo "🏥 Health check starting..."
             HEALTH_URL="http://localhost:$NEW_PORT${{ inputs.health-check-path }}"
             MAX_ATTEMPTS=${{ inputs.health-check-attempts }}
+            HEALTH_CHECK_PASSED=false
             
             for i in $(seq 1 $MAX_ATTEMPTS); do
               echo "  Attempt $i/$MAX_ATTEMPTS..."
             
               if curl -f -s "$HEALTH_URL" > /dev/null 2>&1; then
                 echo "✅ Health check passed!"
+                HEALTH_CHECK_PASSED=true
                 break
               fi
             
@@ -220,8 +222,8 @@ jobs:
               sleep 10
             done
             
-            if [ $i -eq $MAX_ATTEMPTS ]; then
-              echo "❌ Health check failed!"
+            if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
+              echo "❌ Health check failed after $MAX_ATTEMPTS attempts!"
               docker logs $NEW_CONTAINER --tail 30
               docker stop $NEW_CONTAINER || true
               docker rm $NEW_CONTAINER || true
@@ -233,7 +235,11 @@ jobs:
             NGINX_CONF="/etc/nginx/sites-available/${{ inputs.domain }}"
             
             if [ -f "$NGINX_CONF" ]; then
-              sudo cp $NGINX_CONF ${NGINX_CONF}.backup.$(date +%s)
+              # Store backup filename explicitly
+              NGINX_BACKUP="${NGINX_CONF}.backup.$(date +%s)"
+              sudo cp $NGINX_CONF $NGINX_BACKUP
+              echo "Nginx backup created: $NGINX_BACKUP"
+              
               sudo sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
             
               if sudo nginx -t; then
@@ -241,7 +247,8 @@ jobs:
                 echo "✅ Nginx updated"
               else
                 echo "❌ Nginx config error, rolling back..."
-                sudo cp ${NGINX_CONF}.backup.* $NGINX_CONF 2>/dev/null || true
+                sudo cp $NGINX_BACKUP $NGINX_CONF
+                sudo nginx -s reload
                 exit 1
               fi
             else
