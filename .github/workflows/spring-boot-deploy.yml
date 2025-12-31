@@ -62,9 +62,9 @@ on:
         required: true
       SSH_KEY:
         required: false
-      SSH_PORT:
-        required: false
       SSH_PASSWORD:
+        required: false
+      SSH_PORT:
         required: false
       DOCKER_HUB_USERNAME:
         required: true
@@ -90,6 +90,7 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
           password: ${{ secrets.SSH_PASSWORD }}
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
