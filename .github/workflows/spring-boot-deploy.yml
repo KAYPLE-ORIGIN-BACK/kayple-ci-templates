@@ -122,8 +122,10 @@ jobs:
 
             echo "🚀 Starting Blue/Green deployment..."
 
-            # Docker Hub login
-            echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+            # Docker Hub login (use temp config to avoid credential store issues on macOS)
+            DOCKER_CONFIG_DIR=$(mktemp -d)
+            echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker --config "$DOCKER_CONFIG_DIR" login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
+            export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
             
             # Variables
             IMAGE_TAG="${{ inputs.image-tag }}"
