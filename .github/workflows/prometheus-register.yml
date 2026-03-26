@@ -36,6 +36,13 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+      - name: Validate SSH credentials
+        run: |
+          if [ -z "${{ secrets.SSH_KEY }}" ] && [ -z "${{ secrets.SSH_PASSWORD }}" ]; then
+            echo "❌ Either SSH_KEY or SSH_PASSWORD must be provided"
+            exit 1
+          fi
+
       - name: Register with Prometheus
         uses: appleboy/ssh-action@v1.0.3
         with:

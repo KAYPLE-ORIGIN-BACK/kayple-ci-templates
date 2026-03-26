@@ -53,14 +53,18 @@ Deploys application to server using Blue/Green strategy with zero downtime.
 - `health-check-attempts` - Max health check attempts (default: 30)
 - `java-opts` - JVM options (default: '-Xms512m -Xmx1024m')
 - `docker-env-vars` - Environment variables as multiline string (optional)
+- `docker-volumes` - Docker volume mounts as multiline string, format: `host_path:container_path` (optional)
 
 **Secrets:**
 - `SSH_HOST` - Target server IP address (required)
 - `SSH_USER` - SSH username (required)
-- `SSH_KEY` - SSH private key (required)
+- `SSH_KEY` - SSH private key (one of SSH_KEY or SSH_PASSWORD required)
+- `SSH_PASSWORD` - SSH password (one of SSH_KEY or SSH_PASSWORD required)
 - `SSH_PORT` - SSH port (optional, default: 22)
 - `DOCKER_HUB_USERNAME` - Docker Hub username (required)
 - `DOCKER_HUB_ACCESS_TOKEN` - Docker Hub access token (required)
+- `EMAIL_PASSWORD` - Email password for notifications (optional)
+- `SLACK_WEBHOOK_URL` - Slack webhook URL (optional)
 
 ### 3. `prometheus-register.yml`
 Registers deployment with Prometheus for monitoring (optional).
@@ -580,10 +584,10 @@ docker run -d --name my-project-api-pro-BLUE \
   kayplebdev/my-project-api:pro.2024.12.30.41
 
 # Update Nginx
-sudo sed -i 's/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*\//proxy_pass http:\/\/127.0.0.1:8080\//g' \
+sudo sed -i 's/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:8080;/g' \
   /etc/nginx/sites-available/api.my-project.com
 
-sudo nginx -s reload
+sudo systemctl reload nginx
 ```
 
 ### Common Issues

@@ -55,6 +55,22 @@ on:
         type: string
         default: ''
         description: 'Docker volume mounts (multiline, format: host_path:container_path)'
+      nginx-conf-dir:
+        type: string
+        default: '/etc/nginx/sites-available'
+        description: 'Nginx sites-available directory path'
+      nginx-reload-cmd:
+        type: string
+        default: 'sudo systemctl reload nginx'
+        description: 'Command to reload Nginx'
+      nginx-test-cmd:
+        type: string
+        default: 'sudo nginx -t'
+        description: 'Command to test Nginx config'
+      path-prefix:
+        type: string
+        default: ''
+        description: 'PATH prefix to prepend (e.g., /opt/homebrew/bin:/usr/local/bin)'
     secrets:
       SSH_HOST:
         required: true
@@ -79,13 +95,16 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    outputs:
-      active-port: ${{ steps.deploy.outputs.active_port }}
-      active-color: ${{ steps.deploy.outputs.active_color }}
 
     steps:
+      - name: Validate SSH credentials
+        run: |
+          if [ -z "${{ secrets.SSH_KEY }}" ] && [ -z "${{ secrets.SSH_PASSWORD }}" ]; then
+            echo "❌ Either SSH_KEY or SSH_PASSWORD must be provided"
+            exit 1
+          fi
+
       - name: Deploy with Blue/Green strategy
-        id: deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -95,9 +114,14 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
             set -e
-            
+
+            # Set PATH if prefix provided
+            if [ -n "${{ inputs.path-prefix }}" ]; then
+              export PATH="${{ inputs.path-prefix }}:$PATH"
+            fi
+
             echo "🚀 Starting Blue/Green deployment..."
-            
+
             # Docker Hub login
             echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" --password-stdin
             
@@ -235,23 +259,30 @@ jobs:
             
             # Update Nginx
             echo "🔄 Updating Nginx..."
-            NGINX_CONF="/etc/nginx/sites-available/${{ inputs.domain }}"
-            
+            NGINX_CONF="${{ inputs.nginx-conf-dir }}/${{ inputs.domain }}"
+            NGINX_RELOAD_CMD="${{ inputs.nginx-reload-cmd }}"
+            NGINX_TEST_CMD="${{ inputs.nginx-test-cmd }}"
+
             if [ -f "$NGINX_CONF" ]; then
               # Store backup filename explicitly
               NGINX_BACKUP="${NGINX_CONF}.backup.$(date +%s)"
-              sudo cp $NGINX_CONF $NGINX_BACKUP
+              cp $NGINX_CONF $NGINX_BACKUP
               echo "Nginx backup created: $NGINX_BACKUP"
-              
-              sudo sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
-            
-              if sudo nginx -t; then
-                sudo nginx -s reload
+
+              # Use sed compatible with both GNU and BSD
+              if sed --version 2>/dev/null | grep -q GNU; then
+                sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
+              else
+                sed -i '' "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
+              fi
+
+              if eval $NGINX_TEST_CMD; then
+                eval $NGINX_RELOAD_CMD
                 echo "✅ Nginx updated"
               else
                 echo "❌ Nginx config error, rolling back..."
-                sudo cp $NGINX_BACKUP $NGINX_CONF
-                sudo nginx -s reload
+                cp $NGINX_BACKUP $NGINX_CONF
+                eval $NGINX_RELOAD_CMD
                 exit 1
               fi
             else
@@ -260,7 +291,8 @@ jobs:
             
             # Verify traffic switch
             sleep 5
-            if curl -f -s -k "https://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1; then
+            if curl -f -s -k "https://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1 || \
+               curl -f -s "http://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1; then
               echo "✅ Traffic switched successfully"
             else
               echo "⚠️ Traffic verification skipped"
@@ -284,6 +316,5 @@ jobs:
             echo "   Color: $COLOR"
             echo "   JVM: $JAVA_OPTS"
             
-            # Set outputs
-            echo "active_port=$NEW_PORT" >> $GITHUB_OUTPUT
-            echo "active_color=$COLOR" >> $GITHUB_OUTPUT
+            echo "   Active port: $NEW_PORT"
+            echo "   Active color: $COLOR"
