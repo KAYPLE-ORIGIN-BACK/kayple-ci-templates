@@ -86,10 +86,6 @@ on:
         required: true
       DOCKER_HUB_ACCESS_TOKEN:
         required: true
-      EMAIL_PASSWORD:
-        required: false
-      SLACK_WEBHOOK_URL:
-        required: false
 
 jobs:
   deploy:
@@ -115,7 +111,6 @@ jobs:
           script: |
             set -e
 
-            # Set PATH if prefix provided
             if [ -n "${{ inputs.path-prefix }}" ]; then
               export PATH="${{ inputs.path-prefix }}:$PATH"
             fi
@@ -123,12 +118,13 @@ jobs:
             echo "🚀 Starting Blue/Green deployment..."
 
             # Docker Hub login (write auth directly to avoid macOS keychain issues)
+            echo "🔐 Authenticating Docker Hub..."
             DOCKER_CONFIG_DIR=$(mktemp -d)
             AUTH_TOKEN=$(printf '%s:%s' "${{ secrets.DOCKER_HUB_USERNAME }}" "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | base64)
             printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' "$AUTH_TOKEN" > "$DOCKER_CONFIG_DIR/config.json"
             export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
             echo "✅ Docker Hub authenticated"
-            
+
             # Variables
             IMAGE_TAG="${{ inputs.image-tag }}"
             PROJECT="${{ inputs.project-name }}"
@@ -139,10 +135,11 @@ jobs:
             GREEN_PORT="${{ inputs.green-port }}"
             JAVA_OPTS="${{ inputs.java-opts }}"
             CONTAINER_PREFIX="${PROJECT}-${APP}-${ENV}"
-            
+
             echo "📦 Image: $IMAGE_TAG"
             echo "☕ JVM Options: $JAVA_OPTS"
-            
+            echo "🔧 Container prefix: $CONTAINER_PREFIX"
+
             # Pull image
             echo "🔄 Pulling Docker image..."
             if ! docker pull $IMAGE_TAG; then
@@ -150,14 +147,15 @@ jobs:
               exit 1
             fi
             echo "✅ Pull completed"
-            
+
             # Determine current active container and port
+            echo "🔍 Detecting current deployment..."
             CURRENT_CONTAINER=$(docker ps --filter "name=${CONTAINER_PREFIX}" --format "{{.Names}}" | head -1)
-            
+
             if [[ -n "$CURRENT_CONTAINER" ]]; then
               CURRENT_PORT=$(docker port $CURRENT_CONTAINER | grep "$CONTAINER_PORT/tcp" | cut -d':' -f2)
-              echo "🔍 Current: $CURRENT_CONTAINER (port $CURRENT_PORT)"
-            
+              echo "🔵 Current: $CURRENT_CONTAINER (port $CURRENT_PORT)"
+
               if [[ "$CURRENT_PORT" == "$BLUE_PORT" ]]; then
                 NEW_PORT=$GREEN_PORT
                 COLOR="GREEN"
@@ -168,91 +166,76 @@ jobs:
             else
               NEW_PORT=$BLUE_PORT
               COLOR="BLUE"
-              echo "🆕 First deployment"
+              echo "🆕 No existing container found - first deployment"
             fi
-            
-            echo "🎯 Deploying to $COLOR (port $NEW_PORT)"
-            
-            # Prepare new container
+
             NEW_CONTAINER="${CONTAINER_PREFIX}-${COLOR}"
-            
+            echo "🎯 Target: $NEW_CONTAINER (port $NEW_PORT, color $COLOR)"
+
+            # Stop old container on same color if exists
+            echo "🧹 Cleaning up previous $COLOR container..."
             docker stop $NEW_CONTAINER 2>/dev/null || true
             docker rm $NEW_CONTAINER 2>/dev/null || true
-            
+
             # Build docker run command
+            echo "🔨 Building docker run command..."
             DOCKER_CMD="docker run -d --name $NEW_CONTAINER"
             DOCKER_CMD="$DOCKER_CMD -p $NEW_PORT:$CONTAINER_PORT"
             DOCKER_CMD="$DOCKER_CMD -e SPRING_PROFILES_ACTIVE=$ENV"
             DOCKER_CMD="$DOCKER_CMD -e JAVA_OPTS=\"$JAVA_OPTS\""
-            
-            # Add EMAIL_PASSWORD if provided
-            if [ -n "${{ secrets.EMAIL_PASSWORD }}" ]; then
-              DOCKER_CMD="$DOCKER_CMD -e EMAIL_PASSWORD=\"${{ secrets.EMAIL_PASSWORD }}\""
-            fi
-            
-            # Add SLACK_WEBHOOK_URL if provided
-            if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
-              DOCKER_CMD="$DOCKER_CMD -e SLACK_WEBHOOK_URL=\"${{ secrets.SLACK_WEBHOOK_URL }}\""
-            fi
-            
-            # Add additional env vars
+
+            # Additional env vars
             ENV_VARS="${{ inputs.docker-env-vars }}"
             if [ -n "$ENV_VARS" ]; then
+              echo "📝 Adding environment variables..."
               while IFS= read -r line; do
-                if [ -n "$line" ]; then
-                  DOCKER_CMD="$DOCKER_CMD -e \"$line\""
-                fi
+                [ -n "$line" ] && DOCKER_CMD="$DOCKER_CMD -e \"$line\""
               done <<< "$ENV_VARS"
             fi
-            
-            # Add volume mounts
+
+            # Volume mounts
             VOLUMES="${{ inputs.docker-volumes }}"
             if [ -n "$VOLUMES" ]; then
+              echo "💾 Adding volume mounts..."
               while IFS= read -r line; do
-                if [ -n "$line" ]; then
-                  DOCKER_CMD="$DOCKER_CMD -v \"$line\""
-                fi
+                [ -n "$line" ] && DOCKER_CMD="$DOCKER_CMD -v \"$line\""
               done <<< "$VOLUMES"
             fi
-            
+
             DOCKER_CMD="$DOCKER_CMD --restart always $IMAGE_TAG"
-            
-            # Run new container
+
+            # Start container
             echo "🚀 Starting $COLOR container..."
             eval $DOCKER_CMD
-            
+
             if ! docker ps -q --filter "name=$NEW_CONTAINER" | grep -q .; then
               echo "❌ Container failed to start!"
               docker logs $NEW_CONTAINER --tail 30
               exit 1
             fi
-            
             echo "✅ Container started"
-            
+
             # Health check
-            echo "🏥 Health check starting..."
             HEALTH_URL="http://localhost:$NEW_PORT${{ inputs.health-check-path }}"
             MAX_ATTEMPTS=${{ inputs.health-check-attempts }}
             HEALTH_CHECK_PASSED=false
-            
+
+            echo "🏥 Health check starting... ($HEALTH_URL)"
             for i in $(seq 1 $MAX_ATTEMPTS); do
               echo "  Attempt $i/$MAX_ATTEMPTS..."
-            
               if curl -f -s "$HEALTH_URL" > /dev/null 2>&1; then
                 echo "✅ Health check passed!"
                 HEALTH_CHECK_PASSED=true
                 break
               fi
-            
               if ! docker ps -q --filter "name=$NEW_CONTAINER" | grep -q .; then
-                echo "❌ Container stopped!"
+                echo "❌ Container stopped unexpectedly!"
                 docker logs $NEW_CONTAINER --tail 30
                 exit 1
               fi
-            
               sleep 10
             done
-            
+
             if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
               echo "❌ Health check failed after $MAX_ATTEMPTS attempts!"
               docker logs $NEW_CONTAINER --tail 30
@@ -260,65 +243,55 @@ jobs:
               docker rm $NEW_CONTAINER || true
               exit 1
             fi
-            
+
             # Update Nginx
-            echo "🔄 Updating Nginx..."
             NGINX_CONF="${{ inputs.nginx-conf-dir }}/${{ inputs.domain }}"
-            NGINX_RELOAD_CMD="${{ inputs.nginx-reload-cmd }}"
-            NGINX_TEST_CMD="${{ inputs.nginx-test-cmd }}"
+            echo "🔄 Updating Nginx config: $NGINX_CONF"
 
             if [ -f "$NGINX_CONF" ]; then
-              # Store backup filename explicitly
               NGINX_BACKUP="${NGINX_CONF}.backup.$(date +%s)"
               cp $NGINX_CONF $NGINX_BACKUP
-              echo "Nginx backup created: $NGINX_BACKUP"
+              echo "📋 Backup created: $NGINX_BACKUP"
 
-              # Use sed compatible with both GNU and BSD
+              # BSD/GNU sed compatibility
               if sed --version 2>/dev/null | grep -q GNU; then
                 sed -i "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
               else
                 sed -i '' "s/proxy_pass http:\/\/127\.0\.0\.1:[0-9]*;/proxy_pass http:\/\/127.0.0.1:$NEW_PORT;/g" $NGINX_CONF
               fi
 
-              if eval $NGINX_TEST_CMD; then
-                eval $NGINX_RELOAD_CMD
-                echo "✅ Nginx updated"
+              echo "🧪 Testing Nginx config..."
+              if eval ${{ inputs.nginx-test-cmd }}; then
+                eval ${{ inputs.nginx-reload-cmd }}
+                echo "✅ Nginx updated and reloaded"
               else
                 echo "❌ Nginx config error, rolling back..."
                 cp $NGINX_BACKUP $NGINX_CONF
-                eval $NGINX_RELOAD_CMD
+                eval ${{ inputs.nginx-reload-cmd }}
                 exit 1
               fi
             else
-              echo "⚠️ Nginx config not found: $NGINX_CONF"
+              echo "⚠️ Nginx config not found: $NGINX_CONF (skipping)"
             fi
-            
-            # Verify traffic switch
-            sleep 5
-            if curl -f -s -k "https://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1 || \
-               curl -f -s "http://${{ inputs.domain }}${{ inputs.health-check-path }}" > /dev/null 2>&1; then
-              echo "✅ Traffic switched successfully"
-            else
-              echo "⚠️ Traffic verification skipped"
-            fi
-            
+
             # Remove old container
             if [[ -n "$CURRENT_CONTAINER" ]]; then
               echo "🧹 Removing old container: $CURRENT_CONTAINER"
               sleep 10
               docker stop $CURRENT_CONTAINER || true
               docker rm $CURRENT_CONTAINER || true
+              echo "✅ Old container removed"
             fi
-            
-            # Cleanup old images
+
+            echo "🗑️ Pruning unused images..."
             docker image prune -f
-            
+
             echo ""
+            echo "========================================="
             echo "🎉 Deployment completed!"
             echo "   Container: $NEW_CONTAINER"
-            echo "   Port: $NEW_PORT"
-            echo "   Color: $COLOR"
-            echo "   JVM: $JAVA_OPTS"
-            
-            echo "   Active port: $NEW_PORT"
-            echo "   Active color: $COLOR"
+            echo "   Port:      $NEW_PORT"
+            echo "   Color:     $COLOR"
+            echo "   Image:     $IMAGE_TAG"
+            echo "   JVM:       $JAVA_OPTS"
+            echo "========================================="
